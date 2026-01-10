@@ -1,5 +1,5 @@
+from Lancedb_Manager import LawDB as LawManagerLance
 import os
-
 import ollama
 import json
 import time
@@ -12,9 +12,6 @@ from pdf2image import convert_from_path
 from PIL import Image, ImageEnhance, ImageOps
 from docling.document_converter import DocumentConverter
 
-import lancedb
-import pandas as pd
-from sentence_transformers import SentenceTransformer
 import requests
 import zipfile
 import xml.etree.ElementTree as ET
@@ -209,7 +206,41 @@ def get_law_xml(law_name):
             })
     return paragraphs
 
-def write_response(text_to_respond, model_fast=MODEL_GIST, model_final=MODEL_RESPONSE) -> str:
+def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_final=MODEL_RESPONSE) -> str:
+    # Do a first search for laws
+    search_prompt = f"""
+    {text_to_respond}
+    
+    Liste die genannten Rechtsgebiete als Liste von Strings auf. Zum Beispiel aus der Titelzeile oder 
+    anhand der häufigsten Nennungen im Haupttext.
+
+    Format: Rechtsgebiet1++ Rechtsgebiet2++ Rechtsgebiet3++...
+                
+    """
+    fulltext = ""
+    response = ollama.chat(
+        model=model_fast,
+        messages=[{"role": "user", "content": search_prompt}],
+        stream=True,
+        format="json",
+        keep_alive=0,
+        options={
+            "temperature": 0.1,
+            "num_ctx": 32768,
+            "num_predict": 32768
+        }
+    )
+    for chunk in response:
+        content = chunk["message"]["content"]
+        print(content, end="", flush=True)
+        fulltext += content
+
+    law_list = fulltext.split("++")
+    laws = []
+    for law in law_list:
+        print(f"Law: {law}")
+        laws.append(lawDB.search(law,limit=3))
+
     prompt = f"""
     "{text_to_respond}"
     Get the main arguments of the text above, which is in markdown from an corrected OCR pdf. Return them as a JSON 
@@ -218,8 +249,13 @@ def write_response(text_to_respond, model_fast=MODEL_GIST, model_final=MODEL_RES
      "to": name/address recipient, 
      "subject": subject line,
      "deadlines": ["YYYY-MM-DD"], 
+     "laws_cited": Every cited or named law as a list.
+     "legal_area": find the main legal area of the text, maybe from the subject line above the main-text. Use list of laws below
      "arguments": ["first short title": argument text1, second short title: argument text2,....],
      "links": other mentioned documents or statements
+     
+     Laws:
+     {laws}
      
     From your work another AI will write a response to this arguments with other relevant information not contained in the text.
     Arguments have to be complete: GET ALL ARGUMENTS!
@@ -254,8 +290,17 @@ def write_response(text_to_respond, model_fast=MODEL_GIST, model_final=MODEL_RES
         tmp_json = {"fulltext": fulltext}
 
     laws = []
-    research = []
-    mentioned_docs = []
+    if lawDB is not None:
+        for argument in tmp_json["arguments"]:
+            laws.append(lawDB.search(argument[1],limit=3))
+        for law in tmp_json["laws_cited"]:
+            laws.append(lawDB.search(law,limit=3))
+        for law in tmp_json["legal_area"]:
+            laws.append(lawDB.search(law,limit=3))
+    else:
+        laws = ["No relevant laws were mentioned."]
+    research = ["No Reasearch was done on this topic."]
+    mentioned_docs = ["No other documents were mentioned."]
     response_prompt = f"""
     Du bist ein anonymer Fachanwalt für Sozialrecht. Schreibe als dieser eine Antwort GEGEN die Argumente:
     {tmp_json}.
@@ -294,7 +339,7 @@ def main():
     for model in model_list:
         check_and_download_model(model)
     extract_pdf_text = ""
-    #extracted_pdf_text = extract_pdf_data("LRA_StellungnahmeSGD_250115.pdf")
+    # extracted_pdf_text = extract_pdf_data("LRA_StellungnahmeSGD_250115.pdf")
     with open("tmp_text.txt", "r") as f:
         extracted_pdf_text = f.read()
 
@@ -306,13 +351,18 @@ def main():
             break
         else:
             manager = LawManagerLance()
-            manager.add_law_to_db(law_data)
+            manager.add_law(law_data)
         i += 1
+    get_law_xml("sgb_9_2018")
+    get_law_xml("sgb_10")
+    get_law_xml("sgb_11")
+    get_law_xml("sgb_12")
     get_law_xml("kfzhv")
 
     print(extracted_pdf_text)
     # print(extract_pdf_data("Stellungnahme250128.pdf")[1])
-    print(write_response(extracted_pdf_text))
+    print(write_response(extracted_pdf_text, LawManagerLance()))
+
 
 if __name__ == "__main__":
     main()
