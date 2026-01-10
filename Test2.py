@@ -244,13 +244,13 @@ def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_fin
     prompt = f"""
     "{text_to_respond}"
     Get the main arguments of the text above, which is in markdown from an corrected OCR pdf. Return them as a JSON 
-    JSON-Format: 
+    JSON-Format. Everything needs to be GERMAN. Get EVERY argument in the text: 
     "from": name/address sender,
      "to": name/address recipient, 
      "subject": subject line,
      "deadlines": ["YYYY-MM-DD"], 
      "laws_cited": Every cited or named law as a list.
-     "legal_area": find the main legal area of the text, maybe from the subject line above the main-text. Use list of laws below
+     "legal_areas": find the main legal areas of the text, maybe from the subject line above the main-text. Use list of laws below
      "arguments": ["first short title": argument text1, second short title: argument text2,....],
      "links": other mentioned documents or statements
      
@@ -292,9 +292,9 @@ def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_fin
     laws = []
     if lawDB is not None:
         for argument in tmp_json["arguments"]:
-            laws.append(lawDB.search(argument[1],limit=3))
+            laws.append(lawDB.search(argument[1],limit=5))
         for law in tmp_json["laws_cited"]:
-            laws.append(lawDB.search(law,limit=3))
+            laws.append(lawDB.search(law,limit=5))
         for law in tmp_json["legal_area"]:
             laws.append(lawDB.search(law,limit=3))
     else:
@@ -302,7 +302,7 @@ def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_fin
     research = ["No Reasearch was done on this topic."]
     mentioned_docs = ["No other documents were mentioned."]
     response_prompt = f"""
-    Du bist ein anonymer Fachanwalt für Sozialrecht. Du stehst auf der Seite der Antragstellerin! 
+    Du bist ein anonymer Fachanwalt für Sozialrecht. Der Antragsteller ist dein Mandant! 
     Prüfe die vorgebrachten Argumente und argumentiere gegen diese:
     {tmp_json}. 
     
@@ -314,8 +314,6 @@ def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_fin
     
     Beziehe dich außerdem auf die genannten Dokumente, sofern vorhanden:
     {mentioned_docs}
-    
-    For Debug-reasons some texts are empty. Just ignore them.
     """
     start_time = time.time()
     response = ollama.chat(
@@ -346,20 +344,22 @@ def main():
 
     # initialize social law texts
     i = 1
+    manager = LawManagerLance()
     while True:
         law_data = get_law_xml(f"sgb_{i}")
         if law_data == "":
             break
         else:
-            manager = LawManagerLance()
             manager.add_law(law_data)
         i += 1
-    get_law_xml("sgb_9_2018")
-    get_law_xml("sgb_10")
-    get_law_xml("sgb_11")
-    get_law_xml("sgb_12")
-    get_law_xml("kfzhv")
-    get_law_xml("sgg")
+    manager.add_law(get_law_xml("sgb_9_2018"))
+    manager.add_law(get_law_xml("sgb_10"))
+    manager.add_law(get_law_xml("sgb_11"))
+    manager.add_law(get_law_xml("sgb_12"))
+    manager.add_law(get_law_xml("kfzhv"))
+    manager.add_law(get_law_xml("sgg"))
+    manager.add_law(get_law_xml("gg"))
+    manager.add_law(get_law_xml("bgb"))
 
     print(extracted_pdf_text)
     # print(extract_pdf_data("Stellungnahme250128.pdf")[1])
