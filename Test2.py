@@ -302,8 +302,9 @@ def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_fin
     research = ["No Reasearch was done on this topic."]
     mentioned_docs = ["No other documents were mentioned."]
     response_prompt = f"""
-    Du bist ein anonymer Fachanwalt für Sozialrecht. Schreibe als dieser eine Antwort GEGEN die Argumente:
-    {tmp_json}.
+    Du bist ein anonymer Fachanwalt für Sozialrecht. Du stehst auf der Seite der Antragstellerin! 
+    Prüfe die vorgebrachten Argumente und argumentiere gegen diese:
+    {tmp_json}. 
     
     Sei förmlich und klar. Beziehe dich auf die hier relevanten Gesetze:
     {laws}
@@ -358,6 +359,7 @@ def main():
     get_law_xml("sgb_11")
     get_law_xml("sgb_12")
     get_law_xml("kfzhv")
+    get_law_xml("sgg")
 
     print(extracted_pdf_text)
     # print(extract_pdf_data("Stellungnahme250128.pdf")[1])
