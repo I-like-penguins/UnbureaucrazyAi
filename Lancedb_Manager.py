@@ -37,3 +37,6 @@ class LawDB:
         results = table.search(query_vector).limit(limit).to_pandas()
         return results
 
+    def get_query_str_text(self, query, limit=5):
+        tmp_query = self.search(query, limit)
+        return f"id: {tmp_query['id']} text: {(tmp_query['text'])}"

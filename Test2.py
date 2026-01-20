@@ -7,24 +7,38 @@ import io
 import re
 
 from docling_core.types.io import DocumentStream
-from markdown_it.rules_block import paragraph
 from pdf2image import convert_from_path
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import ImageEnhance
 from docling.document_converter import DocumentConverter
 
 import requests
 import zipfile
 import xml.etree.ElementTree as ET
-from io import BytesIO
+from duckduckgo_search import DDGS
+
 
 #MODEL_OCR = "deepseek-r1:7b"
 MODEL_OCR = "qwen2.5:3b"
 MODEL_GIST = "qwen2.5:7b"
-MODEL_RESPONSE = "qwen2.5:7b" # change to 14b maybe
+MODEL_RESPONSE = "gemma3:12b"
 MODEL_RAG = "phi3.5:latest"
 MODEL_EMBEDDING = "nomic-embed-text:latest"
 
 model_list = [MODEL_OCR, MODEL_GIST, MODEL_RESPONSE, MODEL_EMBEDDING, MODEL_RAG]
+
+def get_prompt_result(prompt: str, model_name: str, stream=True,) -> str:
+    """Runs a prompt through a model and returns the result as a string."""
+    response = ollama.chat(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+        stream=stream,
+        keep_alive=0,
+        options={
+            "temperature": 0.1,
+            "num_ctx": 32768,
+            "num_predict": 32768
+        }
+    )
 
 def check_and_download_model(model_name) -> bool:
     """Checks if the model is already downloaded locally and downloads it if not.
@@ -116,8 +130,15 @@ def ocr_enhanced_images(pdf_path, contrast_factor=2.0, sharpness_factor=2.0) -> 
                     break
     return full_text
 
-def extract_pdf_data(pdf_path, model_name=MODEL_OCR):
-    """The basic idea is to take an PDF and extract the text using OCR and then run it through the Ollama model, with the text in prompt, to get the metadata and a more readable and correct version of the text."""
+def extract_pdf_data(pdf_path, model_name=MODEL_OCR, save_as_file=""):
+    """The basic idea is to take an PDF and extract the text using OCR and then run it through the Ollama model,
+     with the text in prompt, to get the metadata and a more readable and correct version of the text.
+
+     :param pdf_path: Path to the PDF file.
+     :param model_name: Name of the Ollama model to use for OCR.
+     :param save_as_file: Path to save the corrected text to. If empty, the corrected text is not saved.
+     :return: The corrected text as a string. Returns an empty string if an error occurs or the text is not readable.
+     """
     if not check_and_download_model(model_name):
         print("Error downloading model. Exiting.")
         return None
@@ -129,10 +150,12 @@ def extract_pdf_data(pdf_path, model_name=MODEL_OCR):
     start_time = time.time()
     fulltext = ""
     prompt = f"""
-    Correct this inconsistent text with OCR errors.
+            Correct this inconsistent text with OCR errors.
             Original Text to be corrected:
             {markdown_text}
-            Correct this text, keep the markdown-format (!) and return it as a string. Focus on grammatical and semantical CORRECTNESS! Keep text to German. Attention! OCR text may contain letters for numbers, like "B" for 6 or 8 and "S" for 5. Correct numbers in context.
+            Correct this text, keep the markdown-format (!) and return it as a string. Focus on grammatical and 
+            semantical CORRECTNESS! Keep text to German. Attention! OCR text may contain letters for numbers, 
+            like "B" for 6 or 8 and "S" for 5. Correct numbers in context.
             Also correct names or jargon if those words occur multiple times.
     """
 
@@ -158,8 +181,10 @@ def extract_pdf_data(pdf_path, model_name=MODEL_OCR):
         fulltext += content
     #print(f"Ollama response: '{response['message']['content']}'")
 
-    end_time = time.time()
-    print(f"Ollama chat completed in {end_time - start_time:.2f} seconds.")
+    print(f"Ollama chat completed in {time.time() - start_time:.2f} seconds.")
+    if save_as_file != "":
+        with open(save_as_file, "w") as f:
+            f.write(fulltext)
     return fulltext
 
 def get_law_xml(law_name):
@@ -215,7 +240,6 @@ def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_fin
     anhand der häufigsten Nennungen im Haupttext.
 
     Format: Rechtsgebiet1++ Rechtsgebiet2++ Rechtsgebiet3++...
-                
     """
     fulltext = ""
     response = ollama.chat(
@@ -238,27 +262,27 @@ def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_fin
     law_list = fulltext.split("++")
     laws = []
     for law in law_list:
-        print(f"Law: {law}")
-        laws.append(lawDB.search(law,limit=3))
+        print(f"Law: {law}") # TODO: Delete this line after testing
+        laws.append(lawDB.search(law.strip(),limit=3))
 
     prompt = f"""
     "{text_to_respond}"
-    Get the main arguments of the text above, which is in markdown from an corrected OCR pdf. Return them as a JSON 
-    JSON-Format. Everything needs to be GERMAN. Get EVERY argument in the text: 
-    "from": name/address sender,
+    Get the main arguments of the text above, which is in markdown from a corrected OCR pdf. Return them as a JSON. 
+    Everything needs to be GERMAN. Get EVERY argument in the text. JSON-Format: 
+    "from": name/address sender (note: may contain forwarded messages!),
      "to": name/address recipient, 
      "subject": subject line,
      "deadlines": ["YYYY-MM-DD"], 
      "laws_cited": Every cited or named law as a list.
      "legal_areas": find the main legal areas of the text, maybe from the subject line above the main-text. Use list of laws below
-     "arguments": ["first short title": argument text1, second short title: argument text2,....],
+     "arguments": {{"first short title": argument text1, second short title: argument text2,....}},
      "links": other mentioned documents or statements
      
      Laws:
      {laws}
      
     From your work another AI will write a response to this arguments with other relevant information not contained in the text.
-    Arguments have to be complete: GET ALL ARGUMENTS!
+    Arguments have to be complete: GET ALL RELEVANT ARGUMENTS!
     """
     start_time = time.time()
     fulltext = ""
@@ -280,8 +304,7 @@ def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_fin
             content = chunk["message"]["content"]
             print (content, end="", flush=True)
             fulltext += content
-    end_time = time.time()
-    print(f"Ollama chat completed in {end_time - start_time:.2f} seconds.")
+    print(f"Ollama chat completed in {time.time() - start_time:.2f} seconds.")
     try:
         cleaned_text = clean_json(fulltext)
         tmp_json = json.loads(cleaned_text)
@@ -289,24 +312,64 @@ def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_fin
         print(f"Error decoding JSON. Raw text returned.")
         tmp_json = {"fulltext": fulltext}
 
+    # Iterate over each argument to get a more detailed analysis. Put those together in a final analysis.
+    # TODO: implement devil's advocat to get a more rounded analysis
+    argument_responses = []
+    if type(tmp_json["arguments"]) is not dict:
+        print(f"Error: expected Arguments to be a dictionary. Trying to convert to dictionary.")
+        tmp_json["arguments"] = dict(tmp_json["arguments"])
+    for titel, argument in tmp_json["arguments"].items():
+        laws = []
+        if lawDB is not None:
+            laws.append(lawDB.get_query_str_text(titel, limit=5))
+            laws.append(lawDB.get_query_str_text(argument, limit=5))
+
+        print(f"Argument: {argument}")
+        arg_prompt = f"""
+            Für das folgende Argument - Titel: {titel} - Argument: {argument} - Erstelle in DEUTSCH eine rechtliche Analyse. 
+            Nenne zuerst das Argument gefolgt von einer detaillierten kritischen Analyse der Rechtslage.
+            
+            Nutze dafür die folgenden Gesetze aus einer Vektor-Datenbank (Suche basiert auf diesen Titel und dieses Argument):
+            {laws}
+            
+            Die Argumente werden gesammelt und später zusammengeführt, durch eine weitere kritische Analyse.
+        """
+        start_time = time.time()
+        response = ollama.chat(
+            model=model_final,
+            messages=[{"role": "user", "content": arg_prompt}],
+            stream=True,
+            options={
+                "temperature": 0.4,
+                "num_ctx": 32768,
+                "num_predict": 32768
+            }
+        )
+        for chunk in response:
+            content = chunk["message"]["content"]
+            print(content, end="", flush=True)
+            fulltext += content
+        end_time = time.time()
+        print(f"Ollama chat completed in {end_time - start_time:.2f} seconds.")
+        argument_responses.append(fulltext)
+
     laws = []
     if lawDB is not None:
-        for argument in tmp_json["arguments"]:
-            laws.append(lawDB.search(argument[1],limit=5))
         for law in tmp_json["laws_cited"]:
             laws.append(lawDB.search(law,limit=5))
-        for law in tmp_json["legal_area"]:
+        for law in tmp_json["legal_areas"]:
             laws.append(lawDB.search(law,limit=3))
     else:
         laws = ["No relevant laws were mentioned."]
     research = ["No Reasearch was done on this topic."]
     mentioned_docs = ["No other documents were mentioned."]
     response_prompt = f"""
-    Du bist ein anonymer Fachanwalt für Sozialrecht. Der Antragsteller ist dein Mandant! 
-    Prüfe die vorgebrachten Argumente und argumentiere gegen diese:
-    {tmp_json}. 
+    Du bist ein anonymer Fachanwalt für Sozialrecht. Du repräsentierst die Gegenseite zu dem vorgelegten Text.
+    Deine Vorarbeiter haben die Argumente bereits analysiert. Fasse alles mit unten stehenden Informationen auf DEUTSCH
+    zusammen:
+    Sei förmlich und klar. Versuche zu überzeugen! 
     
-    Sei förmlich und klar. Beziehe dich auf die hier relevanten Gesetze:
+    Beziehe dich auf die hier relevanten Gesetze:
     {laws}
     
     Und auf die Recherche:
