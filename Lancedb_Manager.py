@@ -35,7 +35,13 @@ class LawDB:
         query_vector = self.__model.encode(query).tolist()
 
         results = table.search(query_vector).limit(limit).to_pandas()
-        return results
+        context_list = []
+        for _, row in results.iterrows():
+            full_text = str(row['text']).strip()
+            law_id = row.get('id')
+            formatted_text = f"id: {law_id} text: {full_text}"
+            context_list.append(formatted_text)
+        return "\n\n" + 30*"-" +"\n\n".join(context_list) + "\n\n" + 30*"-"
 
     def get_query_str_text(self, query, limit=5):
         tmp_query = self.search(query, limit)

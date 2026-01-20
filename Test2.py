@@ -1,5 +1,6 @@
 from Lancedb_Manager import LawDB as LawManagerLance
 import os
+from pathlib import Path
 import ollama
 import json
 import time
@@ -139,11 +140,27 @@ def extract_pdf_data(pdf_path, model_name=MODEL_OCR, save_as_file=""):
      :param save_as_file: Path to save the corrected text to. If empty, the corrected text is not saved.
      :return: The corrected text as a string. Returns an empty string if an error occurs or the text is not readable.
      """
+    if save_as_file != "":
+        path = Path(f"./tmp/{save_as_file}_ocr.txt")
+        if path.exists():
+            print(f"File {path} already exists. Skipping OCR.")
+            return path.read_text()
+    if not os.path.exists(pdf_path):
+        print(f"PDF file {pdf_path} not found. Exiting.")
+        return ""
     if not check_and_download_model(model_name):
         print("Error downloading model. Exiting.")
         return None
 
-    markdown_text = ocr_enhanced_images(pdf_path)
+    path = Path(f"./tmp/{save_as_file}_markdown.txt")
+    if path.exists():
+        print(f"File {path} already exists. Skipping first step of OCR.")
+        markdown_text = path.read_text()
+    else:
+        markdown_text = ocr_enhanced_images(pdf_path)
+        if save_as_file != "":
+            if write_tmp_file(markdown_text, f"./tmp/{save_as_file}_markdown.txt"):
+                print(f"Raw OCR text saved to '{save_as_file}_markdown.txt'.")
 
     # First correct the original text with MODEL_OCR
     print(f"Starting Ollama chat with model {model_name}...")
@@ -183,9 +200,24 @@ def extract_pdf_data(pdf_path, model_name=MODEL_OCR, save_as_file=""):
 
     print(f"Ollama chat completed in {time.time() - start_time:.2f} seconds.")
     if save_as_file != "":
-        with open(save_as_file, "w") as f:
-            f.write(fulltext)
+        if write_tmp_file(fulltext, f"./tmp/{save_as_file}_ocr.txt"):
+            print(f"OCR corrected text saved to {save_as_file}_ocr.txt.")
+        else:
+            print(f"Error writing OCR corrected text to {save_as_file}_ocr.txt.")
     return fulltext
+
+def write_tmp_file(text, file_path="") -> bool:
+    """Writes a string to a temporary file. Returns True if successful, False otherwise."""
+    if file_path != "":
+        try:
+            output_file = Path(file_path)
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            output_file.write_text(text)
+        except Exception as e:
+            print(f"Error writing output file: {e}. Just returning text.")
+            return False
+        return True
+    return False # return False if no file_path
 
 def get_law_xml(law_name):
     """Downloads the xml-zip from gesetze-im-internet and extracts the law text from it
@@ -231,39 +263,76 @@ def get_law_xml(law_name):
             })
     return paragraphs
 
-def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_final=MODEL_RESPONSE) -> str:
-    # Do a first search for laws
-    search_prompt = f"""
-    {text_to_respond}
-    
-    Liste die genannten Rechtsgebiete als Liste von Strings auf. Zum Beispiel aus der Titelzeile oder 
-    anhand der häufigsten Nennungen im Haupttext.
+def generate_search_query(argument_titel, argument_inhalt):
+    prompt = f"""
+    Analysiere dieses juristische Argument und erstelle EINE präzise Suchanfrage für eine Rechtsdatenbank, 
+    um relevante Urteile oder Kommentare zu finden.
 
-    Format: Rechtsgebiet1++ Rechtsgebiet2++ Rechtsgebiet3++...
+    TITEL: {argument_titel}
+    INHALT: {argument_inhalt}
+
+    ANTWORTE NUR MIT DER SUCHANFRAGE. Kein "Hier ist die Suche...", keine Anführungszeichen.
     """
+    response = ollama.chat(model='gemma3:4b', messages=[{'role': 'user', 'content': prompt}])
+    return response['message']['content'].strip()
+
+def perform_web_search(query):
+    print(f"--- Suche im Web nach: {query} ---")
+    with DDGS() as ddgs:
+        results = ddgs.text(query, max_results=3)
+        web_context = ""
+        for r in results:
+            web_context += f"TITEL: {r['title']}\nINHALT: {r['body']}\nQUELLE: {r['href']}\n\n"
+        return web_context
+
+def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_final=MODEL_RESPONSE, save_as_file="") -> str:
+    # Do a first search for laws
     fulltext = ""
-    response = ollama.chat(
-        model=model_fast,
-        messages=[{"role": "user", "content": search_prompt}],
-        stream=True,
-        format="json",
-        keep_alive=0,
-        options={
-            "temperature": 0.1,
-            "num_ctx": 32768,
-            "num_predict": 32768
-        }
-    )
-    for chunk in response:
-        content = chunk["message"]["content"]
-        print(content, end="", flush=True)
-        fulltext += content
+    path = Path(f"./tmp/{save_as_file}_lawareas.txt")
+    if path.exists():
+        print(f"File {path} already exists. Skipping accumulation of law areas.")
+        fulltext = path.read_text()
+    else:
+        search_prompt = f"""
+        {text_to_respond}
+        
+        Liste die genannten Rechtsgebiete als Liste von Strings auf. Zum Beispiel aus der Titelzeile oder 
+        anhand der häufigsten Nennungen im Haupttext.
+    
+        Format: Rechtsgebiet1++ Rechtsgebiet2++ Rechtsgebiet3++...
+        """
+        fulltext = ""
+        response = ollama.chat(
+            model=model_fast,
+            messages=[{"role": "user", "content": search_prompt}],
+            stream=True,
+            format="json",
+            keep_alive=0,
+            options={
+                "temperature": 0.1,
+                "num_ctx": 32768,
+                "num_predict": 32768,
+                "repeat_penalty": 1.2,
+            }
+        )
+        death_counter = 0
+        for chunk in response:
+            content = chunk["message"]["content"]
+            print(content, end="", flush=True)
+            fulltext += content
+            if content in fulltext:
+                death_counter += 1
+                if death_counter > 500:
+                    print(f"Ollama chat failed. Exiting.")
+        if write_tmp_file(fulltext, f"./tmp/{save_as_file}_lawareas.txt"):
+            print(f"Laws saved to './tmp/{save_as_file}_lawareas.txt'.")
 
     law_list = fulltext.split("++")
     laws = []
     for law in law_list:
         print(f"Law: {law}") # TODO: Delete this line after testing
-        laws.append(lawDB.search(law.strip(),limit=3))
+        print(f"DEBUG: {lawDB.search(law.strip(),limit=5)}")
+        laws.append(lawDB.search(law.strip(),limit=5))
 
     prompt = f"""
     "{text_to_respond}"
@@ -311,6 +380,8 @@ def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_fin
     except json.JSONDecodeError:
         print(f"Error decoding JSON. Raw text returned.")
         tmp_json = {"fulltext": fulltext}
+    if write_tmp_file(fulltext, f"./tmp/{save_as_file}_response.json"):
+        print(f"Response saved to '{save_as_file}_response.json'.")
 
     # Iterate over each argument to get a more detailed analysis. Put those together in a final analysis.
     # TODO: implement devil's advocat to get a more rounded analysis
@@ -318,19 +389,26 @@ def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_fin
     if type(tmp_json["arguments"]) is not dict:
         print(f"Error: expected Arguments to be a dictionary. Trying to convert to dictionary.")
         tmp_json["arguments"] = dict(tmp_json["arguments"])
+    global_search_results = []
     for titel, argument in tmp_json["arguments"].items():
         laws = []
         if lawDB is not None:
-            laws.append(lawDB.get_query_str_text(titel, limit=5))
-            laws.append(lawDB.get_query_str_text(argument, limit=5))
+            laws.append(lawDB.get_query_str_text(argument, limit=7))
 
         print(f"Argument: {argument}")
+        search_query = generate_search_query(titel, argument)
+        query_response = perform_web_search(search_query)
+        global_search_results.append(query_response)
+
         arg_prompt = f"""
             Für das folgende Argument - Titel: {titel} - Argument: {argument} - Erstelle in DEUTSCH eine rechtliche Analyse. 
             Nenne zuerst das Argument gefolgt von einer detaillierten kritischen Analyse der Rechtslage.
             
             Nutze dafür die folgenden Gesetze aus einer Vektor-Datenbank (Suche basiert auf diesen Titel und dieses Argument):
             {laws}
+            
+            Nutze die Ergebnisse der Websuche:
+            {query_response}
             
             Die Argumente werden gesammelt und später zusammengeführt, durch eine weitere kritische Analyse.
         """
@@ -359,12 +437,14 @@ def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_fin
             laws.append(lawDB.search(law,limit=5))
         for law in tmp_json["legal_areas"]:
             laws.append(lawDB.search(law,limit=3))
+        for text in global_search_results:
+            laws.append(lawDB.search(text,limit=3))
     else:
         laws = ["No relevant laws were mentioned."]
-    research = ["No Reasearch was done on this topic."]
     mentioned_docs = ["No other documents were mentioned."]
     response_prompt = f"""
-    Du bist ein anonymer Fachanwalt für Sozialrecht. Du repräsentierst die Gegenseite zu dem vorgelegten Text.
+    {argument_responses}
+    Du bist ein anonymer Fachanwalt für Sozialrecht. Du repräsentierst die Gegenseite zu den oben vorgelegten Texten.
     Deine Vorarbeiter haben die Argumente bereits analysiert. Fasse alles mit unten stehenden Informationen auf DEUTSCH
     zusammen:
     Sei förmlich und klar. Versuche zu überzeugen! 
@@ -373,7 +453,7 @@ def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_fin
     {laws}
     
     Und auf die Recherche:
-    {research}
+    {global_search_results}
     
     Beziehe dich außerdem auf die genannten Dokumente, sofern vorhanden:
     {mentioned_docs}
@@ -400,10 +480,7 @@ def write_response(text_to_respond, lawDB=None, model_fast=MODEL_GIST, model_fin
 def main():
     for model in model_list:
         check_and_download_model(model)
-    extract_pdf_text = ""
-    # extracted_pdf_text = extract_pdf_data("LRA_StellungnahmeSGD_250115.pdf")
-    with open("tmp_text.txt", "r") as f:
-        extracted_pdf_text = f.read()
+    extracted_pdf_text = extract_pdf_data("Schreiben_LRA_Sommerurlaub25_260119.pdf", save_as_file="Schreiben_LRA_Sommerurlaub25_260119")
 
     # initialize social law texts
     i = 1
@@ -426,8 +503,7 @@ def main():
 
     print(extracted_pdf_text)
     # print(extract_pdf_data("Stellungnahme250128.pdf")[1])
-    print(write_response(extracted_pdf_text, LawManagerLance()))
-
+    print(write_response(extracted_pdf_text, LawManagerLance(), save_as_file="Schreiben_LRA_Sommerurlaub25_260119"))
 
 if __name__ == "__main__":
     main()
