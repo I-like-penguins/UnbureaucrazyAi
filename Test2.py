@@ -15,6 +15,7 @@ from docling_core.types.io import DocumentStream
 from pdf2image import convert_from_path
 from PIL import ImageEnhance
 from docling.document_converter import DocumentConverter
+import fitz
 
 import requests
 import zipfile
@@ -28,7 +29,7 @@ except AttributeError:
 else:
     ssl._create_default_https_context = _create_unverified_https_context
 
-# 2. Umgebungsvariablen für zugrundeliegende HTTP-Libraries (httpx, requests)
+# Umgebungsvariablen für zugrundeliegende HTTP-Libraries (httpx, requests)
 os.environ['CURL_CA_BUNDLE'] = ''
 os.environ['PYTHONHTTPSVERIFY'] = '0'
 
@@ -38,26 +39,13 @@ import trafilatura
 from playwright.sync_api import sync_playwright
 
 MODEL_OCR = "qwen2.5:7b"
-MODEL_GIST = "gemma3:12b" #"qwen2.5:7b"
+MODEL_GIST = "deepseek-r1:8b"
 MODEL_RESPONSE = "gemma3:12b"
 MODEL_RAG = "phi3.5:latest"
 MODEL_EMBEDDING = "nomic-embed-text:latest"
+MODEL_VLM = "glm-ocr"
 
 model_list = [MODEL_OCR, MODEL_GIST, MODEL_RESPONSE, MODEL_EMBEDDING, MODEL_RAG]
-
-def get_prompt_result(prompt: str, model_name: str, stream=True,) -> str:
-    """Runs a prompt through a model and returns the result as a string."""
-    response = ollama.chat(
-        model=model_name,
-        messages=[{"role": "user", "content": prompt}],
-        stream=stream,
-        keep_alive=0,
-        options={
-            "temperature": 0.1,
-            "num_ctx": 32768,
-            "num_predict": 32768
-        }
-    )
 
 def check_and_download_model(model_name) -> bool:
     """Checks if the model is already downloaded locally and downloads it if not.
@@ -87,11 +75,6 @@ def clean_json(raw_content):
     if raw_content is None or "":
         print("Error: raw_content is None.")
         return "{}"
-    open_braces = raw_content.count('{') - raw_content.count('}')
-    open_brackets = raw_content.count('[') - raw_content.count(']')
-
-    raw_content += ']' * open_brackets
-    raw_content += '}' * open_braces
 
     cleaned = re.sub(r'```json\s?|\s?```', '', raw_content).strip()
     match = re.search(r'(\{.*\})', cleaned, re.DOTALL)
@@ -103,8 +86,8 @@ def clean_json(raw_content):
 
 def check_readability(text):
     """Checks a text against occurrences of high-probability German words or if it is empty. True if readable"""
-    if len(text) < 20:  # Empty pages are okay
-        return True
+    if len(text) < 20:  # Empty pages are to be skipped
+        return False
     word_list = ["der", "die", "das", "und", "oder", "nicht", "wir", "ihr", "sie", "ist", "mit", "von", "den"]
     count = sum(1 for word in word_list if word in text.lower())
     return count > 1
@@ -145,7 +128,7 @@ def ocr_enhanced_images(pdf_path, contrast_factor=2.0, sharpness_factor=2.0) -> 
                 j += 1
                 if j > 1:   # experience shows, docling reads 180 degree rotation
                     print(f"Page {i+1} is not readable. Skipping.")
-                    full_text += f"Nicht lesbar.\n++++#\n"
+                    full_text += f"\n++++#\n"
                     break
                 img_bytes = io.BytesIO()
                 page.rotate(90)
@@ -157,6 +140,69 @@ def ocr_enhanced_images(pdf_path, contrast_factor=2.0, sharpness_factor=2.0) -> 
                 if check_readability(markdown_text):
                     full_text += f"{markdown_text}\n++++#\n"
                     break
+    return full_text
+
+def is_scanned_pdf(pdf_path) -> bool:
+    """Checks if a PDF is scanned or not. Returns True if scanned, False if not scanned."""
+    doc = fitz.open(pdf_path)
+    for page in doc:
+        if page.get_text().strip() or page.get_fonts():
+            return False
+    return True
+
+def extract_pdf_vlm(pdf_path, save_file=True, output_folder="./brain", model=MODEL_VLM):
+    """VLM Test"""
+    path_str = f"{output_folder}/{pdf_path.split(".")[0]}_ocr.txt"
+    full_text = ""
+    if save_file and output_folder:
+        path = Path(path_str)
+        if path.exists():
+            print(f"OCR-file already exists at {path}. Using existing file.")
+            return path.read_text()
+    print(f"Starting OCR...")
+    if not is_scanned_pdf(pdf_path):
+        print("PDF is not scanned. Extracting text directly from PDF.")
+        doc = fitz.open(pdf_path)
+        full_text = f"\n ---- Ende der Seite ----#\n".join(page.get_text() for page in doc)
+    else:
+        images = convert_from_path(pdf_path, 250)
+        full_text = ""
+        for i, image in enumerate(images):
+            image = image.convert("L")  # Greyscale image
+            enhancer = ImageEnhance.Contrast(image)
+            image = enhancer.enhance(2.0)
+            enhancer = ImageEnhance.Sharpness(image)
+            image = enhancer.enhance(2.0)
+            image.save(f"tmp_img_{i}.png", "PNG")
+            image_path = os.path.abspath(f"tmp_img_{i}.png")
+            print(f"Processing page {i+1}...")
+            start_time = time.time()
+            with open(image_path, 'rb') as f:
+                stream = ollama.chat(
+                    model=model,
+                    stream=True,
+                    messages=[{
+                        'role': 'user',
+                        'content': f"""### ANWEISUNG
+                                    Gib mir den Text auf DEUTSCH wider, ohne Veränderungen. Erhalte ggf. Tabellen! Nutze MARKDOWN!!
+                                    Schreibe nur den Text, ohne die Anweisung! Gib bei leeren Seiten einen leeren Text zurück!
+                        """,
+                        'images': [f.read()]}
+                    ],
+                    options={'temperature': 0.1, 'top_k': 40, 'top_p': 0.9, 'seed': 42, 'num_ctx': 8192*3, 'repeat_penalty': 1.3}
+                )
+                for chunk in stream:
+                    content = chunk['message']['content']
+                    print(content, end='', flush=True)
+                    full_text += content
+
+            print(f"\nPage {i + 1} processed in {time.time() - start_time:.2f} seconds.")
+            full_text += f"\n ---- Ende Seite {i+1} ----#\n"
+            time.sleep(2)
+
+    if save_file and output_folder:
+        if write_tmp_file(full_text, path_str):
+            print(f"Saved ocr-text to file {path_str}")
     return full_text
 
 def extract_pdf_data(pdf_path, model_name=MODEL_OCR, save_as_file=""):
@@ -181,7 +227,7 @@ def extract_pdf_data(pdf_path, model_name=MODEL_OCR, save_as_file=""):
         return None
 
     path = Path(f"./brain/{save_as_file}_markdown.txt")
-    if path.exists():
+    if save_as_file != "" and path.exists():
         print(f"File {path} already exists. Skipping first step of OCR.")
         markdown_text = path.read_text()
     else:
@@ -195,14 +241,15 @@ def extract_pdf_data(pdf_path, model_name=MODEL_OCR, save_as_file=""):
     start_time = time.time()
     fulltext = ""
     for i, page in enumerate(markdown_text.split("++++#")):
+        if page == "":
+            continue
         prompt = f"""
-                Korrigiere diese fehlerhafte OCR-Seite. Nutze Markdown-Format (!) und gib den korrigierten Text als
-                String zurück. Behalte das Format bei! Erfinde nichts dazu! Original Text:
+                Korrigiere diese fehlerhafte OCR-Seite. Text enthält womöglich Zahlen für Buchstaben und andersherum, z.B. B für 6 oder 8 oder A für 4.
+                Gib den Text ohne eigene Einleitung und ohne eigenen Schlusssatz einfach nur so wieder wie korrigiert! #### Nutze Markdown-Format (!) und gib den korrigierten Text als
+                String zurück. Behalte das Format bei! Leere Seiten als leeren String zurückgeben! Erfinde nichts dazu! 
+                Original Text: 
                 {page}
-                
-                ACHTUNG! Text enthält womöglich Zahlen für Buchstaben und andersherum, z.B. B für 6 oder 8 oder A für 4.
-                Gib den Text ohne eigene Einleitung und ohne eigenen Schlusssatz einfach nur so wieder wie korrigiert!
-        """
+                """
 
         response = ollama.chat(
             model=model_name,
@@ -243,7 +290,8 @@ def write_tmp_file(text, file_path="") -> bool:
             output_file.parent.mkdir(parents=True, exist_ok=True)
             output_file.write_text(text)
         except Exception as e:
-            print(f"Error writing output file: {e}. Just returning text.")
+            print(f"Error writing output file: {e}. Printing text instead.")
+            print(text)
             return False
         return True
     return False # return False if no file_path
@@ -360,8 +408,10 @@ def perform_web_search(query, max_results=1):
 def perform_tavily_search(query):
     print(f"--- Suche in Tavily nach: {query} ---")
     tavily_client = TavilyClient(api_key="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")
-    response = tavily_client.search(query)
-    return response
+    # response = tavily_client.search(query)
+    # print(f"Tavily response: {response}")   # TODO: Delete this line.
+    # return response
+    return "Websuche noch nicht implementiert! FÜhre eine Abfrage in der Datenbank durch."
 
 def page_to_json(path: Path, text, page=1, model=MODEL_GIST, lanceDB=None):
     prompt = f"""
@@ -369,14 +419,12 @@ def page_to_json(path: Path, text, page=1, model=MODEL_GIST, lanceDB=None):
                         Extrahiere folgende Informationen von dieser Seite, für einen späteren Denkprozess!
                         NUR DEUTSCH. NUR JSON-Format:
                         {{
-                            "Seite: {page}
-                            "Inhalt": {{
-                                "Fristen": ["YYYY-MM-DD"], 
-                                "Gesetze": Alle konkret benannten Gesetze als Liste.
-                                "Rechtsgebiet": Finde das hauptsächliche Rechtsgebiet dieser Seite.
-                                "Argument": Zusammenfassung des Inhalts dieser Seite. Sei AUSFÜHRLICH und FAKTENTREU.
-                                "Verweise": Andere Dokumente, die genannt oder auf die verwiesen wurde.
-                                }}
+                            "Seite": {page},
+                            "Fristen": ["YYYY-MM-DD"], 
+                            "Gesetze": Alle konkret benannten Gesetze als Liste.
+                            "Rechtsgebiet": Finde das hauptsächliche Rechtsgebiet dieser Seite.
+                            "Argument": Zusammenfassung des Inhalts dieser Seite. Sei AUSFÜHRLICH und FAKTENTREU.
+                            "Verweise": Andere Dokumente, die genannt oder auf die verwiesen wurde.
                         }}
                     """
     start_time = time.time()
@@ -387,8 +435,8 @@ def page_to_json(path: Path, text, page=1, model=MODEL_GIST, lanceDB=None):
         format="json",
         options={
             "temperature": 0.1,
-            "num_ctx": 16384,
-            "num_predict": 16384 * 2
+            "num_ctx": 32768,
+            "num_predict": 32768
         }
     )
     page_json = ""
@@ -397,137 +445,157 @@ def page_to_json(path: Path, text, page=1, model=MODEL_GIST, lanceDB=None):
         print(content, end="", flush=True)
         page_json += content
     print(f"Ollama chat completed in {time.time() - start_time:.2f} seconds.")
-
-    if lanceDB is not None:
-        manager = lanceDB
-        manager.add_page_json(str(path), page_json, page)
-    return page_json
+    try:
+        if lanceDB is not None:
+            manager = lanceDB
+            manager.add_page_json(str(path), page_json, page)
+        return page_json
+    except:
+        print()
 
 def write_response(text_to_respond, lanceDB=None, model_fast=MODEL_GIST, model_final=MODEL_RESPONSE, save_as_file="") -> str:
-    # Do a first search for laws
-    tmp_json = {}
     json_list = []
-    global_search_results = ""
-    arguments = {}      # Title: argument
+    global_search_results = []
     # split text into pages to reduce memory usage for AI - long texts destroy prompt
     # get JSON of every page for later processing
     page_before = ""
     fulltext = ""
-    for i, page in enumerate(text_to_respond.split("\n---- ")):
-        page_json = ""
-        if i == 0:
-            continue        # the first split is useless, skip it
+    for i, page in enumerate(text_to_respond.split("----#")):
         path = Path(f"./brain/{save_as_file}_page_{i}.json")
         if path.exists():
-            print(f"File {path} already exists. Skipping creating JSON from page {i}.")
+            print(f"File {path} already exists. Skipping creating JSON of page {i}.")
             json_list.append(path.read_text())
             page_before = path.read_text()
         else:
             page_json = page_to_json(path,f"### DIESE Seite: {page}\n### VORHERIGE Seite: {page_before}", i,
-                                     model=model_fast, lanceDB=ManagerLance())
+                                     model=model_fast)
             if write_tmp_file(page_json, f"./brain/{save_as_file}_page_{i}.json"):
                 print(f"JSON saved to '{save_as_file}_page_{i}.json'.")
-        page_before = page
-        json_list.append(page_json)
-
-    # get all mentioned laws from the database
-    laws = []
-    laws_cited = []
-    for json_page in json_list:
-        try:
-            tmp_json = json.loads(json_page)
-            for law in tmp_json["Inhalt"]["Gesetze"]:
-                if law not in laws_cited:
-                    laws_cited.append(law)
-                    laws.append(lanceDB.search(law, "law_table", limit=1))
-            laws.append(lanceDB.search(tmp_json["Inhalt"]["Rechtsgebiet"], "law_table", limit=3))
-        except json.JSONDecodeError as e:
-            print(f"Error decoding JSON. Error: {e}")
-            try:
-                tmp_json = json.loads(json_page)
-            except json.JSONDecodeError as e:
-                print(f"Not possibe to encode: '{json_page}'")
-                continue
-        except KeyError as e:
-            print(f"Error decoding JSON. Error: {e}")
-            continue
-    blnExit = False
+            page_before = page
+            json_list.append(page_json)
     i = 0
     thinking_process = ""
-    task = "Analysiere das vorliegende Dokument, damit daraus später ein Antwortschreiben generiert werden kann."
-    path = Path(f"./brain/{save_as_file}_page_1.json")
-    doc_db = lanceDB.search(str(path), "doc_table", limit=5)
-    while not blnExit:
-        # Start thinking process until satisfied or loop-kill, do websearches or querries to database automatically.
+    parts_of_answer = []
+    # doc_db = lanceDB.search(f"./brain/{save_as_file}_page_*.json", "page_table", limit=8)
+    path = Path(f"./brain/{save_as_file}_ocr.txt")
+    doc_length = len(path.read_text().split("\n---- "))
+    for current_page in path.read_text().split("\n---- "):
+        # Start analyzing text until satisfied or loop-kill, do websearches or querries to database automatically.
+        print(f"Seite: {i} - Denkprozess.......")     # TODO: Delete this line
         thinking_prompt = f"""
-        Dein Auftrag:
-        {task}
-        
-        Gefundene Dokumentauszüge:
-        {doc_db}
-        
-        ### DENKPROZESS!!! ###
-        ### Runde {i+1}: ###
-        
-        Wähle NUR EINES:
-        Wenn Denken erfüllt, Schreibe nur "EXIT"
-        Wenn Websuche erforderlich, Schreibe "WEBSEARCH:" gefolgt von der Suchanfrage. Halte dich kurz.
-        Wenn Suche in Gesetze-Vektordatenbank erforderlich, Schreibe "GESETZE:" gefolgt von dem Paragraphen und dem Gesetzbuch
-        Wenn Denkprozess, Schreibe "PROCESS:" gefolgt von einem Absatz an Gedanken zum Text.
-        Wenn sich der Auftrag ändern soll, Schreibe "NEU:" gefolgt von einem neuen Auftrag.
-        
-        Nutze folgende Gesetze aus der Vektor-Datenbank:
-        {laws}
-        
-        Letzte Denkprozesse (letzten 500 Zeichen):
-        {thinking_process[:500]}
-        
-        Bisherige Suchergebnisse:
-        {global_search_results}
-        """
+                    #### Analysiere die vorliegende Dokumentenseite, damit eine KI damit arbeiten kann. Stelle auch FRAGEN! ####
+                    SEITE: {i}/{doc_length}
+                    +++++++
+                    Zu analysierende Seite: "{current_page}"
+                    +++++++
+                    #### HALTE DICH KURZ!! RELEVANTE INFORMATIONEN MÜSSEN VOLLSTÄNDIG SEIN!!! ####
+                    #### WICHTIG!! - Seiten ohne juristischen Inhalt sind zu ignorieren!! ####
+                """
         start_time = time.time()
         response = ollama.chat(
-            model=model_final,
+            model=model_fast,
             messages=[{"role": "user", "content": thinking_prompt}],
             stream=True,
+            think=True,
             options={
-                "temperature": 0.4,
+                "temperature": 0.35,
                 "num_ctx": 32768*1.5,
-                "num_predict": 32768/2
+                "num_predict": 32768
             }
         )
+        fulltext = ""
+        is_thinking = False
         for chunk in response:
-            content = chunk["message"]["content"]
-            print(content, end="", flush=True)
-            fulltext += content
+            if chunk.message.thinking and not is_thinking:
+                is_thinking = True
+                print("Thinking...")
+            if chunk.message.thinking:
+                print(chunk.message.thinking, end='')
+            elif chunk.message.content:
+                if is_thinking:
+                    print('\n\nAnswer:\n', end='')
+                    is_thinking = False
+                print(chunk.message.content, end='')
+            fulltext += chunk.message.content
+        end_time = time.time()
+        print("")
+        print(f"Ollama chat completed in {end_time - start_time:.2f} seconds.")
+        thinking_process += f"Runde: {i + 1}|{fulltext.strip()}"
+
+        path = Path(f"./brain/{save_as_file}_page_{i}.json")
+        if not path.exists():
+            i += 1
+            continue
+        json_page = path.read_text()
+        laws = []
+        laws_cited = []
+        try:
+            tmp_json = json.loads(json_page)
+            for law in tmp_json["Gesetze"]:
+                if law not in laws_cited:
+                    laws_cited.append(law)
+                    laws.append(lanceDB.search_law_id(law))
+                    laws.append(lanceDB.search(law, "law_table", limit=2))
+            laws.append(lanceDB.search(tmp_json["Rechtsgebiet"], "law_table", limit=1))
+            laws.append(lanceDB.search(tmp_json["Argument"], "law_table", limit=1))
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON. Error: {e}")
+            i += 1
+            continue
+        except KeyError as e:
+            print(f"Error decoding JSON. Error: {e}")
+            i += 1
+            continue
+        control_prompt = f"""
+            #### Prüfe die vorliegende Seite!! Verfasse ggf. eine Antwort GEGEN die vorgebrachten falschen Argumente! Beziehe Gesetze mit ein! ####
+            ### HALTE DICH KURZ! Keine Anrede oder Schlussformel! Kein Fazit!! ###
+            Jetzige Runde: {i}/{doc_length}
+            Bisherige Ausgaben der KI (inkl. diese Runde):
+            {thinking_process.split("Runde: ")[-3] if len(thinking_process.split("Runde: ")) > 3 else thinking_process}
+            
+            Gesetze:
+            {laws}
+            
+            #### IGNORIERE SEITEN OHNE JURISTISCHE RELEVANZ!!! ####
+        """
+        print("Kontrollprozess....")
+        start_time = time.time()
+        response = ollama.chat(
+            model=model_fast,
+            messages=[{"role": "user", "content": control_prompt}],
+            stream=True,
+            think=True,
+            options={
+                "temperature": 0.2,
+                "num_ctx": 32768,
+                "num_predict": 32768}
+        )
+        fulltext = ""
+        is_thinking = False
+        for chunk in response:
+            if chunk.message.thinking and not is_thinking:
+                is_thinking = True
+                print("Thinking...")
+            if chunk.message.thinking:
+                print(chunk.message.thinking, end='')
+            elif chunk.message.content:
+                if is_thinking:
+                    print('\n\nAnswer:\n', end='')
+                    is_thinking = False
+                print(chunk.message.content, end='')
+            fulltext += chunk.message.content
         end_time = time.time()
         print(f"Ollama chat completed in {end_time - start_time:.2f} seconds.")
-        if "EXIT" in fulltext or i > 29:
-            print("Exiting thinking process.")
-            blnExit = True
-        elif "WEBSEARCH:" in fulltext:
-            print("Starting web search.")
-            query = fulltext.split("WEBSEARCH:")[1].strip()
-            global_search_results.append(perform_tavily_search(query))
-        elif "GESETZE:" in fulltext:
-            print("Starting law search.")
-            laws.append(lanceDB.search(fulltext.split("GESETZE:")[1].strip(), "law_table", limit=3))
-        elif "PROCESS:" in fulltext:
-            print("Starting process step.")
-            thinking_process += f"Runde: {i+1}\n{fulltext.split("PROCESS:")[1].strip()}"
-        elif "NEU:" in fulltext:
-            task = fulltext.split("NEU:")[1].strip()
+        parts_of_answer.append(fulltext)
         i += 1
 
     # TODO: implement devil's advocat to get a more rounded analysis
 
     arg_prompt = f"""
-        {arguments}
-        Für die vorstehende LISTE an Argumenten (Titel: Argument), erstelle in DEUTSCH eine rechtliche vollständige Analyse. 
+        {parts_of_answer}
+        Du bist ein anonymer FACHANWALT für Sozialrecht. Aus der vorstehenden LISTE, erstelle in DEUTSCH eine 
+        rechtlich vollständige Antwort. 
         Nenne zuerst das Argument gefolgt von einer detaillierten kritischen Analyse der Rechtslage.
-                
-        Nutze dafür die folgenden Gesetze aus der Vektor-Datenbank:
-        {laws}
                 
         Nutze die Ergebnisse der Websuche, falls relevant:
         {global_search_results}
@@ -550,59 +618,18 @@ def write_response(text_to_respond, lanceDB=None, model_fast=MODEL_GIST, model_f
     end_time = time.time()
     print(f"Ollama chat completed in {end_time - start_time:.2f} seconds.")
 
-    laws = []
-    if lanceDB is not None:
-        for law in tmp_json["laws_cited"]:
-            laws.append(lanceDB.search(law,"law_table",limit=5))
-        for law in tmp_json["legal_areas"]:
-            laws.append(lanceDB.search(law,"law_table",limit=3))
-        for text in global_search_results:
-            laws.append(lanceDB.search(text,"law_table",limit=3))
-    else:
-        laws = ["No relevant laws were mentioned."]
-    mentioned_docs = ["No other documents were mentioned."]
-    response_prompt = f"""
-    Du bist ein anonymer Fachanwalt für Sozialrecht. Du repräsentierst die Gegenseite zu den oben vorgelegten Texten.
-    Deine Vorarbeiter haben die Argumente bereits analysiert. Fasse alles mit unten stehenden Informationen auf DEUTSCH
-    zusammen:
-    Sei förmlich und klar. Versuche zu überzeugen! 
-    
-    Beziehe dich auf die hier relevanten Gesetze:
-    {laws}
-    
-    Und auf die Recherche:
-    {global_search_results}
-    
-    Beziehe dich außerdem auf die genannten Dokumente, sofern vorhanden:
-    {mentioned_docs}
-    """
-    start_time = time.time()
-    response = ollama.chat(
-        model=model_final,
-        messages=[{"role": "user", "content": response_prompt}],
-        stream=True,
-        options = {
-            "temperature": 0.5,
-            "num_ctx": 32768,
-            "num_predict": 32768
-        }
-    )
-    for chunk in response:
-        content = chunk["message"]["content"]
-        print(content, end="", flush=True)
-        fulltext += content
-    end_time = time.time()
-    print(f"Ollama chat completed in {end_time - start_time:.2f} seconds.")
     return fulltext
 
 def main():
     for model in model_list:
         check_and_download_model(model)
-    extracted_pdf_text = extract_pdf_data("Schreiben_SG_LRA_Widerspruchsbescheid-Urlaub25.pdf", save_as_file="Schreiben_SG_LRA_Widerspruchsbescheid-Urlaub25")
+    manager = ManagerLance(restart_table=True)
+    tmp_txt = extract_pdf_vlm("Schreiben_SG_LRA_Widerspruchsbescheid-Urlaub25.pdf")
+    #extracted_pdf_text = extract_pdf_data("Schreiben_SG_LRA_Widerspruchsbescheid-Urlaub25.pdf", save_as_file="Schreiben_SG_LRA_Widerspruchsbescheid-Urlaub25")
 
     # initialize social law texts
     i = 1
-    manager = ManagerLance()
+
     while True:
         law_data = get_law_xml(f"sgb_{i}")
         if law_data == "":
@@ -620,9 +647,10 @@ def main():
     manager.add_law(get_law_xml("bgb"))
     manager.add_law(get_law_xml("agg"))
 
-    print(extracted_pdf_text)
+    print("test")
+    print(tmp_txt)
     # print(extract_pdf_data("Stellungnahme250128.pdf")[1])
-    print(write_response(extracted_pdf_text, save_as_file="Schreiben_SG_LRA_Widerspruchsbescheid-Urlaub25"))
-
+    if write_tmp_file(write_response(tmp_txt, manager, save_as_file="Schreiben_SG_LRA_Widerspruchsbescheid-Urlaub25"),"Schreiben_SG_LRA_Widerspruchsbescheid-Urlaub25.txt"):
+        print("Successfully saved response!")
 if __name__ == "__main__":
     main()
