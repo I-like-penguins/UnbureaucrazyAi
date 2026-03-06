@@ -624,8 +624,7 @@ def main():
     for model in model_list:
         check_and_download_model(model)
     manager = ManagerLance(restart_table=True)
-    tmp_txt = extract_pdf_vlm("Schreiben_SG_LRA_Widerspruchsbescheid-Urlaub25.pdf")
-    #extracted_pdf_text = extract_pdf_data("Schreiben_SG_LRA_Widerspruchsbescheid-Urlaub25.pdf", save_as_file="Schreiben_SG_LRA_Widerspruchsbescheid-Urlaub25")
+    tmp_txt = extract_pdf_vlm("")
 
     # initialize social law texts
     i = 1
@@ -650,7 +649,7 @@ def main():
     print("test")
     print(tmp_txt)
     # print(extract_pdf_data("Stellungnahme250128.pdf")[1])
-    if write_tmp_file(write_response(tmp_txt, manager, save_as_file="Schreiben_SG_LRA_Widerspruchsbescheid-Urlaub25"),"Schreiben_SG_LRA_Widerspruchsbescheid-Urlaub25.txt"):
+    if write_tmp_file(write_response(tmp_txt, manager, save_as_file=""),""):
         print("Successfully saved response!")
 if __name__ == "__main__":
     main()
