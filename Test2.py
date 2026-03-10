@@ -1,4 +1,8 @@
 from ddgs.exceptions import DDGSException
+from ddgs import DDGS
+import httpx
+import trafilatura
+from playwright.sync_api import sync_playwright
 from tavily import TavilyClient
 
 from Lancedb_Manager import BrainDB as ManagerLance
@@ -14,7 +18,6 @@ import re
 from docling_core.types.io import DocumentStream
 from pdf2image import convert_from_path
 from PIL import ImageEnhance
-from docling.document_converter import DocumentConverter
 import fitz
 
 import requests
@@ -33,10 +36,6 @@ else:
 os.environ['CURL_CA_BUNDLE'] = ''
 os.environ['PYTHONHTTPSVERIFY'] = '0'
 
-from ddgs import DDGS
-import httpx
-import trafilatura
-from playwright.sync_api import sync_playwright
 
 MODEL_OCR = "qwen2.5:7b"
 MODEL_GIST = "deepseek-r1:8b"
@@ -92,56 +91,6 @@ def check_readability(text):
     count = sum(1 for word in word_list if word in text.lower())
     return count > 1
 
-def ocr_enhanced_images(pdf_path, contrast_factor=2.0, sharpness_factor=2.0) -> str:
-    """
-    Gets the text from a PDF using OCR after enhancing the images for readability. Also rotates images 180 degrees if they are not readable.
-    :param pdf_path: Path to the PDF file.
-    :param contrast_factor: Contrast factor to adjust image contrast.
-    :param sharpness_factor: Sharpness factor to adjust image sharpness.
-    :return: A Markdown string with the OCR text of all pages in the PDF. Returns an empty string if the text is not readable.
-    """
-    pages = convert_from_path(pdf_path, 400)
-    converter = DocumentConverter()
-    enhanced_images = []
-    full_text = ""
-    for i, page in enumerate(pages):
-        print(f"Processing page {i+1}/{len(pages)}")
-        page = page.convert("L") # Greyscale image
-        enhancer = ImageEnhance.Contrast(page)
-        page = enhancer.enhance(contrast_factor)
-        enhancer = ImageEnhance.Sharpness(page)
-        page = enhancer.enhance(sharpness_factor)
-        enhanced_images.append(page)
-
-        img_bytes = io.BytesIO()
-        page.save(img_bytes, format="PNG")
-        img_bytes.seek(0)
-        doc_stream = DocumentStream(name=f"page_{i+1}.png", stream=img_bytes)
-        result = converter.convert(doc_stream)
-        markdown_text = result.document.export_to_markdown()
-        if check_readability(markdown_text):
-            full_text += f"{markdown_text}\n++++#\n"
-        else:
-            print(f"Page {i + 1}/{len(pages)} maybe rotated?")
-            j = 0
-            while True:
-                j += 1
-                if j > 1:   # experience shows, docling reads 180 degree rotation
-                    print(f"Page {i+1} is not readable. Skipping.")
-                    full_text += f"\n++++#\n"
-                    break
-                img_bytes = io.BytesIO()
-                page.rotate(90)
-                page.save(img_bytes, format="PNG")
-                img_bytes.seek(0)
-                doc_stream = DocumentStream(name=f"page_{i+1}_{j}.png", stream=img_bytes)
-                result = converter.convert(doc_stream)
-                markdown_text = result.document.export_to_markdown()
-                if check_readability(markdown_text):
-                    full_text += f"{markdown_text}\n++++#\n"
-                    break
-    return full_text
-
 def is_scanned_pdf(pdf_path) -> bool:
     """Checks if a PDF is scanned or not. Returns True if scanned, False if not scanned."""
     doc = fitz.open(pdf_path)
@@ -173,8 +122,8 @@ def extract_pdf_vlm(pdf_path, save_file=True, output_folder="./brain", model=MOD
             image = enhancer.enhance(2.0)
             enhancer = ImageEnhance.Sharpness(image)
             image = enhancer.enhance(2.0)
-            image.save(f"tmp_img_{i}.png", "PNG")
             image_path = os.path.abspath(f"tmp_img_{i}.png")
+            image.save(image_path, "PNG")
             print(f"Processing page {i+1}...")
             start_time = time.time()
             with open(image_path, 'rb') as f:
@@ -183,19 +132,16 @@ def extract_pdf_vlm(pdf_path, save_file=True, output_folder="./brain", model=MOD
                     stream=True,
                     messages=[{
                         'role': 'user',
-                        'content': f"""### ANWEISUNG
-                                    Gib mir den Text auf DEUTSCH wider, ohne Veränderungen. Erhalte ggf. Tabellen! Nutze MARKDOWN!!
-                                    Schreibe nur den Text, ohne die Anweisung! Gib bei leeren Seiten einen leeren Text zurück!
-                        """,
+                        'content': f""""Extrahiere den Text dieser Seite. STARTE UNBEDINGT beim Briefkopf (Absender/Empfänger). Arbeite dich strikt von OBEN nach UNTEN vor. Ignoriere die Fußzeile vorerst!""",
                         'images': [f.read()]}
                     ],
-                    options={'temperature': 0.1, 'top_k': 40, 'top_p': 0.9, 'seed': 42, 'num_ctx': 8192*3, 'repeat_penalty': 1.3}
+                    options={'temperature': 0.0, 'top_k': 40, 'top_p': 0.9, 'seed': 42, 'num_predict': 4069, 'num_ctx': 8192*3, 'repeat_penalty': 1.5}
                 )
                 for chunk in stream:
                     content = chunk['message']['content']
                     print(content, end='', flush=True)
                     full_text += content
-
+            os.remove(image_path)
             print(f"\nPage {i + 1} processed in {time.time() - start_time:.2f} seconds.")
             full_text += f"\n ---- Ende Seite {i+1} ----#\n"
             time.sleep(2)
@@ -204,83 +150,6 @@ def extract_pdf_vlm(pdf_path, save_file=True, output_folder="./brain", model=MOD
         if write_tmp_file(full_text, path_str):
             print(f"Saved ocr-text to file {path_str}")
     return full_text
-
-def extract_pdf_data(pdf_path, model_name=MODEL_OCR, save_as_file=""):
-    """The basic idea is to take an PDF and extract the text using OCR and then run it through the Ollama model,
-     with the text in prompt, to get the metadata and a more readable and correct version of the text.
-
-     :param pdf_path: Path to the PDF file.
-     :param model_name: Name of the Ollama model to use for OCR.
-     :param save_as_file: Path to save the corrected text to. If empty, the corrected text is not saved.
-     :return: The corrected text as a string. Returns an empty string if an error occurs or the text is not readable.
-     """
-    if save_as_file != "":
-        path = Path(f"./brain/{save_as_file}_ocr.txt")
-        if path.exists():
-            print(f"File {path} already exists. Skipping OCR.")
-            return path.read_text()
-    if not os.path.exists(pdf_path):
-        print(f"PDF file {pdf_path} not found. Exiting.")
-        return ""
-    if not check_and_download_model(model_name):
-        print("Error downloading model. Exiting.")
-        return None
-
-    path = Path(f"./brain/{save_as_file}_markdown.txt")
-    if save_as_file != "" and path.exists():
-        print(f"File {path} already exists. Skipping first step of OCR.")
-        markdown_text = path.read_text()
-    else:
-        markdown_text = ocr_enhanced_images(pdf_path)
-        if save_as_file != "":
-            if write_tmp_file(markdown_text, f"./brain/{save_as_file}_markdown.txt"):
-                print(f"Raw OCR text saved to '{save_as_file}_markdown.txt'.")
-
-    # First correct the original text with MODEL_OCR
-    print(f"Starting Ollama chat with model {model_name}...")
-    start_time = time.time()
-    fulltext = ""
-    for i, page in enumerate(markdown_text.split("++++#")):
-        if page == "":
-            continue
-        prompt = f"""
-                Korrigiere diese fehlerhafte OCR-Seite. Text enthält womöglich Zahlen für Buchstaben und andersherum, z.B. B für 6 oder 8 oder A für 4.
-                Gib den Text ohne eigene Einleitung und ohne eigenen Schlusssatz einfach nur so wieder wie korrigiert! #### Nutze Markdown-Format (!) und gib den korrigierten Text als
-                String zurück. Behalte das Format bei! Leere Seiten als leeren String zurückgeben! Erfinde nichts dazu! 
-                Original Text: 
-                {page}
-                """
-
-        response = ollama.chat(
-            model=model_name,
-            messages=[
-                        {"role": "user",
-                        "content": prompt,
-                        }
-                    ],
-            stream=True,
-            keep_alive=0,
-            options={
-                "temperature": 0.1,
-                "num_ctx": 32768,
-                "num_predict": 32768
-            },
-        )
-        # for debugging, to see if anything is happening
-        for chunk in response:
-            content = chunk["message"]["content"]
-            print (content, end="", flush=True)
-            fulltext += content
-        #print(f"Ollama response: '{response['message']['content']}'")
-        fulltext += "\n---- Seite " + str(i+1) + " ----\n"
-
-    print(f"Ollama chat completed in {time.time() - start_time:.2f} seconds.")
-    if save_as_file != "":
-        if write_tmp_file(fulltext, f"./brain/{save_as_file}_ocr.txt"):
-            print(f"OCR corrected text saved to {save_as_file}_ocr.txt.")
-        else:
-            print(f"Error writing OCR corrected text to {save_as_file}_ocr.txt.")
-    return fulltext
 
 def write_tmp_file(text, file_path="") -> bool:
     """Writes a string to a temporary file. Returns True if successful, False otherwise."""
@@ -407,7 +276,7 @@ def perform_web_search(query, max_results=1):
 
 def perform_tavily_search(query):
     print(f"--- Suche in Tavily nach: {query} ---")
-    tavily_client = TavilyClient(api_key="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")
+    tavily_client = TavilyClient()
     # response = tavily_client.search(query)
     # print(f"Tavily response: {response}")   # TODO: Delete this line.
     # return response
@@ -478,8 +347,8 @@ def write_response(text_to_respond, lanceDB=None, model_fast=MODEL_GIST, model_f
     parts_of_answer = []
     # doc_db = lanceDB.search(f"./brain/{save_as_file}_page_*.json", "page_table", limit=8)
     path = Path(f"./brain/{save_as_file}_ocr.txt")
-    doc_length = len(path.read_text().split("\n---- "))
-    for current_page in path.read_text().split("\n---- "):
+    doc_length = len(path.read_text().split("----#"))
+    for current_page in path.read_text().split("----#"):
         # Start analyzing text until satisfied or loop-kill, do websearches or querries to database automatically.
         print(f"Seite: {i} - Denkprozess.......")     # TODO: Delete this line
         thinking_prompt = f"""
@@ -623,8 +492,8 @@ def write_response(text_to_respond, lanceDB=None, model_fast=MODEL_GIST, model_f
 def main():
     for model in model_list:
         check_and_download_model(model)
-    manager = ManagerLance(restart_table=True)
-    tmp_txt = extract_pdf_vlm("")
+    manager = ManagerLance()
+    tmp_txt = extract_pdf_vlm("Schreiben_SG_LRA_Autotausch_260217.pdf")
 
     # initialize social law texts
     i = 1
@@ -649,7 +518,7 @@ def main():
     print("test")
     print(tmp_txt)
     # print(extract_pdf_data("Stellungnahme250128.pdf")[1])
-    if write_tmp_file(write_response(tmp_txt, manager, save_as_file=""),""):
+    if write_tmp_file(write_response(tmp_txt, manager, save_as_file="Schreiben_SG_LRA_Autotausch_260217"),"Schreiben_SG_LRA_Autotausch_260217_AW.txt"):
         print("Successfully saved response!")
 if __name__ == "__main__":
     main()
