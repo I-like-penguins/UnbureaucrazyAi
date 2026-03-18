@@ -518,7 +518,7 @@ def main():
     print("test")
     print(tmp_txt)
     # print(extract_pdf_data("Stellungnahme250128.pdf")[1])
-    if write_tmp_file(write_response(tmp_txt, manager, save_as_file="Schreiben_SG_LRA_Autotausch_260217"),"Schreiben_SG_LRA_Autotausch_260217_AW.txt"):
+    if write_tmp_file(write_response(tmp_txt, manager, save_as_file=""),"_AW.txt"):
         print("Successfully saved response!")
 if __name__ == "__main__":
     main()
