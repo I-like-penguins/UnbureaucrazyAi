@@ -493,7 +493,7 @@ def main():
     for model in model_list:
         check_and_download_model(model)
     manager = ManagerLance()
-    tmp_txt = extract_pdf_vlm("Schreiben_SG_LRA_Autotausch_260217.pdf")
+    tmp_txt = extract_pdf_vlm("")
 
     # initialize social law texts
     i = 1
